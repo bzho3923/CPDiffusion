@@ -26,7 +26,7 @@ def get_node_feature_dims():
     update Apr 6th:
     remove bfactor as there is no bfactor in predicted structure
     '''
-    return [20, 1, 4, 5]
+    return [20, 1, 1, 4, 5]
 
 
 def get_edge_feature_dims():

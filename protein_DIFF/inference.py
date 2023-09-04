@@ -64,7 +64,7 @@ if __name__ == '__main__':
     print(target_protein_test_id)
     target_protein_train_dataset = Cath(target_protein_train_id, args.target_protein_dir)
     target_protein_test_dataset = Cath(target_protein_test_id, args.target_protein_dir)
-    protein_name = args.target_protein.split("/")[-3]
+    protein_name = args.target_protein.split("/")[-1].split(".")[0]
     
     print(f'train on {protein_name} dataset with {len(target_protein_train_dataset)}  training data and {len(target_protein_test_dataset)}  val data')
     input_feat_dim = target_protein_train_dataset[0].x.shape[1]+target_protein_train_dataset[0].extra_x.shape[1]
@@ -82,7 +82,7 @@ if __name__ == '__main__':
                         save_and_sample_every=10,
                         train_num_steps=48000,
                         train_lr=config['lr'],
-                        results_folder=config['output_dir'])
+                        results_folder="result/weight/")
 
     relative_ckpt_path = "/".join(args.ckpt.split('/')[2:])
     trainer.load(milestone=9,filename=relative_ckpt_path)
