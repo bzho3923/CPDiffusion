@@ -1,19 +1,14 @@
 # A conditional protein diffusion model generates artificial programmable endonuclease sequences with enhanced activity
 
+## 🚀 Introduction
+
+The approach achieved over a 10-fold increase in DNA cleavage activity in two complex multi-domain functional proteins (Kurthia massiliensis Ago and Pyrococcus furiosus Ago, referred to as KmAgo and PfAgo), significantly surpassing any existing wild-type protein activity at ambient temperature.
+
+<img src="img/framework.png" alt="Logo">
+
 ## 🤖 Inference with Ago protein
 
-```shell
-CUDA_VISIBLE_DEVICES=0 python protein_DIFF/inference.py \
-    --ckpt ckpt/Jun_5_ago_dataset=CATH_result_lr=0.0005_wd=0.0_dp=0.08_hidden=256_noisy_type=uniform_embed_ss=False_88935.pt \
-    --target_protein dataset/Ago/AGO_050_model_3_ptm.pt \
-    --target_protein_dir dataset/Ago/process/ \
-    --gen_num 100 \
-    --output_dir result/predict
-```
-
-## 🚀 Inference with Ago protein
-
-### prepare personal dataset
+### prepare dataset
 
 ```shell
 mkdir -p dataset/Ago
