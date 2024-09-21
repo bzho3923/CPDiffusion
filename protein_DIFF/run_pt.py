@@ -34,6 +34,10 @@ from dataset.large_dataset import Cath
 from dataset.utils import NormalizeProtein,substitute_label
 from dataset.cath_imem_2nd import Cath_imem,dataset_argument
 
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
+from Bio import SeqIO
+from MSA_Transition_Matrix import MSA_retrieval
 
 amino_acids_type = ['A', 'R', 'N', 'D', 'C', 'Q', 'E', 'G', 'H', 'I',
                 'L', 'K', 'M', 'F', 'P', 'S', 'T', 'W', 'Y', 'V']
@@ -544,6 +548,92 @@ class Sparse_DIGRESS(nn.Module):
         
         return X_s,final_predicted_X if last_step else None
     
+    def sample_p_zs_given_zt_MSA(self,t,s,zt,data,temperature,last_step,cond=False, MSA_retrieval_ratio=0):
+        """
+        sample zs~p(zs|zt)
+        """
+
+        beta_t = self.noise_schedule(t_normalized=t)
+        alpha_s_bar = self.noise_schedule.get_alpha_bar(t_normalized=s)#check for this
+        alpha_t_bar = self.noise_schedule.get_alpha_bar(t_normalized=t)#check for this
+
+        Qtb = self.transition_model.get_Qt_bar(alpha_t_bar, data.x.device)
+        Qsb = self.transition_model.get_Qt_bar(alpha_s_bar, data.x.device)
+        # Qt = self.transition_model.get_Qt(beta_t, data.x.device)
+        Qt = (Qtb/Qsb)/(Qtb/Qsb).sum(dim=1).unsqueeze(dim=2)
+
+        noise_data = data.clone()   
+        noise_data.x = zt #x_t
+        pred,_ = self.model(noise_data,t*self.timesteps)
+        pred_X = F.softmax(pred,dim = -1) #\hat{p(X)}_0
+        
+        if isinstance(cond, torch.Tensor):
+            pred_X[cond] = data.x[cond]
+
+        if last_step:
+            pred = pred**temperature
+            pred_X = F.softmax(pred,dim = -1)
+            # add MSA distribution here
+            # 序列输入到tmp/i.fasta
+            MSA_pred_X = None
+            seq_list = ['']*(1+data.batch[-1])
+            for i, aa_type in enumerate(data.x.argmax(dim=1)):
+                seq_list[data.batch[i]] += amino_acids_type[aa_type]
+            for i, seq in enumerate(seq_list):
+                print('seq len: ', len(seq), 'seq: ', seq)
+                record = SeqRecord(Seq(seq), id=str(i))
+                records = [record]
+                fasta_file = 'protein_DIFF/test_rr_tmp/'+str(i)+'.fasta'
+                MSA_a2m_file = 'protein_DIFF/test_rr_tmp/'+str(i)+'.a2m'
+                SeqIO.write(records, fasta_file, 'fasta')
+                if str(i)+'.a2m' not in os.listdir('protein_DIFF/test_rr_tmp/'):
+                    p = os.popen('hhblits -i '+fasta_file+' -d /data/alphafold2/data/bfd/bfd_metaclust_clu_complete_id30_c90_final_seq.sorted_opt -d /data/alphafold2/data/pdb70/pdb70 -d /data/alphafold2/data/uniclust30/uniclust30_2018_08/uniclust30_2018_08  -o example.hhr  -oa3m tmp.a3m  -n 3  -id 90  -cov 50  -cpu 8')
+                    print(p.read())
+                    p.close()
+                    p = os.popen(' reformat.pl tmp.a3m '+MSA_a2m_file)
+                    print(p.read())
+                    p.close()
+                MSA_pred_X_single_seq = MSA_retrieval(MSA_a2m_file)
+                if MSA_pred_X is None:
+                    MSA_pred_X = MSA_pred_X_single_seq
+                else:
+                    MSA_pred_X = torch.cat([MSA_pred_X, MSA_pred_X_single_seq], dim=0)
+            print('MSA_pred_X shape: ', MSA_pred_X.shape)
+            print('MSA_pred_X: ', MSA_pred_X)
+            # os.removedirs('protein_DIFF/test_rr_tmp/')
+            # os.makedirs('protein_DIFF/test_rr_tmp/')
+
+            if type(MSA_retrieval_ratio) is list:
+                final_predicted_X_list = []
+                for ratio in MSA_retrieval_ratio:
+                    mixed_pred_X = (1-ratio)*pred_X + ratio*MSA_pred_X
+                    sample_s = mixed_pred_X.argmax(dim=1)
+                    final_predicted_X = F.one_hot(sample_s, num_classes=20).float()
+                    # final_predicted_X_list.append(final_predicted_X.clone())
+                    final_predicted_X_list.append(final_predicted_X)
+                return pred, final_predicted_X_list
+
+            else:
+                # sample_s = pred_X.multinomial(1).squeeze()
+                mixed_pred_X = (1 - MSA_retrieval_ratio) * pred_X + MSA_retrieval_ratio * MSA_pred_X
+                sample_s = mixed_pred_X.argmax(dim=1)
+                final_predicted_X = F.one_hot(sample_s,num_classes = 20).float()
+
+                return pred,final_predicted_X
+            
+        
+        p_s_and_t_given_0_X = self.compute_batched_over0_posterior_distribution(X_t=zt,Q_t=Qt,Qsb=Qsb,Qtb=Qtb,data=data)#[N,d0,d_t-1] 20,20
+        weighted_X = pred_X.unsqueeze(-1) * p_s_and_t_given_0_X #[N,d0,d_t-1]
+        unnormalized_prob_X = weighted_X.sum(dim=1)             #[N,d_t-1]
+        unnormalized_prob_X[torch.sum(unnormalized_prob_X, dim=-1) == 0] = 1e-5
+        prob_X = unnormalized_prob_X / torch.sum(unnormalized_prob_X, dim=-1, keepdim=True)  #[N,d_t-1]
+        # prob_X = prob_X/temperature
+        sample_s = prob_X.multinomial(1).squeeze()
+        # sample_s = prob_X.argmax(1).squeeze()
+        X_s = F.one_hot(sample_s,num_classes = 20).float()
+        
+        return X_s,final_predicted_X if last_step else None
+    
     def sample(self,data,cond = False,temperature=1.0,stop = 0):
         limit_dist = torch.ones(20)/20
         zt = self.sample_discrete_feature_noise(limit_dist = limit_dist,num_node = data.x.shape[0]) #[N,20] one hot 
@@ -557,7 +647,7 @@ class Sparse_DIGRESS(nn.Module):
             zt , final_predicted_X  = self.sample_p_zs_given_zt(t_norm, s_norm,zt, data,temperature,last_step=s_int==stop)
         return zt,final_predicted_X
 
-    def ddim_sample(self,data,cond = False,temperature=1.0,stop = 0,step=10):
+    def ddim_sample(self,data,cond = False,temperature=1.0,stop = 0,step=10, ratio=0):
         limit_dist = torch.ones(20)/20
         zt = self.sample_discrete_feature_noise(limit_dist = limit_dist,num_node = data.x.shape[0]) #[N,20] one hot 
         zt = zt.to(data.x.device)
@@ -567,8 +657,10 @@ class Sparse_DIGRESS(nn.Module):
             t_array = s_array + step
             s_norm = s_array / self.timesteps
             t_norm = t_array /self.timesteps
-            zt , final_predicted_X  = self.sample_p_zs_given_zt(t_norm, s_norm,zt, data,temperature,last_step=s_int==stop,cond=cond)
-        
+            if ratio != 0:
+                zt , final_predicted_X  = self.sample_p_zs_given_zt_MSA(t_norm, s_norm,zt, data,temperature,last_step=s_int==stop,cond=cond, MSA_retrieval_ratio=ratio)
+            else:
+                zt , final_predicted_X  = self.sample_p_zs_given_zt(t_norm, s_norm,zt, data,temperature,last_step=s_int==stop,cond=cond)
         
         
         return zt,final_predicted_X
@@ -712,8 +804,10 @@ def seq_recovery(data,pred_seq):
     recovery_list = []
     for i in range(data.ptr.shape[0]-1):
         nature_seq = data.x[data.ptr[i]:data.ptr[i+1],:].argmax(dim=1)
+        # print('nature_seq', data.x[data.ptr[i]:data.ptr[i+1],:])
         pred = pred_seq[data.ptr[i]:data.ptr[i+1],:].argmax(dim=1)
-        recovery = (nature_seq==pred).sum()/nature_seq.shape[0]
+        # print('pred_seq', pred_seq[data.ptr[i]:data.ptr[i+1],:])
+        recovery = ((nature_seq==pred).sum()/nature_seq.shape[0])
         recovery_list.append(recovery.item())
 
     return recovery_list
@@ -738,7 +832,7 @@ class Trianer(object):
         adam_betas = (0.9, 0.99),
         save_and_sample_every = 10000,
         num_samples = 25,
-        results_folder = './protein_DIFF/results',
+        results_folder = './result',
         amp = False,
         fp16 = False,
         split_batches = True,
@@ -814,8 +908,10 @@ class Trianer(object):
     def load(self, milestone,filename =False):
         # accelerator = self.accelerator
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        print(f"loading from {self.results_folder}")
         if filename:
-            data = torch.load(str(self.results_folder)+'/'+filename, map_location=device)
+            # data = torch.load(str(self.results_folder)+'/'+filename, map_location=device)
+            data = torch.load(filename, map_location=device)
         else:
             data = torch.load(str(self.results_folder / self.config['Date']+f"model_lr={self.config['lr']}_dp={self.config['drop_out']}_timestep={self.config['timesteps']}_hidden={self.config['hidden_dim']}_{milestone}.pt"), map_location=device)
 
@@ -835,6 +931,342 @@ class Trianer(object):
 
         # if exists(self.accelerator.scaler) and exists(data['scaler']):
         #     self.accelerator.scaler.load_state_dict(data['scaler'])
+
+    def train(self):
+        lr_schedule = True
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        train_loss,ce_loss_list,mse_loss_list,recovery_list,perplexity,val_loss_list,corr_record= [],[],[],[],[],[],[]
+        total_loss,total_ce_loss,total_mse_loss = 5,5,5
+        corr_list = [ [] for i in range(28)]
+        val_loss = torch.tensor([5.0])
+        with tqdm(initial = self.step, total = self.train_num_steps) as pbar:
+            while self.step < self.train_num_steps:
+                for _ in range(self.gradient_accumulate_every):
+                    # data = next(self.dl).to(device)
+                    data = next(self.dl)
+                    loss,ce_loss,mse_loss = self.model(data)
+                    loss = loss / self.gradient_accumulate_every
+                    ce_loss = ce_loss / self.gradient_accumulate_every
+                    total_loss += loss.mean().item()
+                    total_ce_loss += ce_loss.mean().item()
+                    if self.config['pred_sasa']: 
+                        total_mse_loss += mse_loss.mean().item()
+
+                    loss.mean().backward()
+
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['clip_grad_norm'])
+                all_iter = len(self.ds)//self.batch_size
+                num_iter = self.step % all_iter +1
+                pbar.set_description(f'loss: {total_loss/num_iter:.4f}')
+
+                if self.step%(len(self.ds)//self.batch_size) == 0 and self.step != 0:
+                    
+                    train_loss.append(total_loss/all_iter)
+                    ce_loss_list.append(total_ce_loss/all_iter)
+                    if self.config['pred_sasa']:
+                        mse_loss_list.append(total_mse_loss/all_iter)
+                    val_loss_list.append(val_loss.item())
+                    total_loss = 0
+                    total_ce_loss = 0
+                    total_mse_loss = 0
+
+                self.opt.step()
+                self.opt.zero_grad()
+
+
+                self.step += 1
+                # if self.step > self.train_num_steps*3/4 and lr_schedule:
+                #     for g in self.opt.param_groups:
+                #         g['lr'] = self.config['lr']*0.1
+                #     lr_schedule = False
+                # elif self.step <5000:#warm up
+                #     for g in self.opt.param_groups:
+                #         g['lr'] = 1e-7 
+                # else:
+                #     for g in self.opt.param_groups:
+                #         g['lr'] = self.config['lr']                         
+
+                self.ema.to(device)
+                self.ema.update()
+
+                if self.step != 0 and self.step % (self.save_and_sample_every*(len(self.ds)//self.batch_size)) == 0:
+                    self.ema.ema_model.eval()
+
+                    with torch.no_grad():
+                        sub_list = []
+                        for data in self.val_loader:
+                            data = data.to(device)
+                            
+                            # _,predx = self.model(data,logit=True)
+                            # _,ema_pred = self.ema.ema_model.forward(data)
+                            # val_loss,_,_,_ = self.ema.ema_model.compute_val_loss(data,False)
+                            val_loss,ce_loss,mse_loss = self.ema.ema_model(data)
+
+                            zt,sample_graph = self.ema.ema_model.ddim_sample(data,self.config['sample_temperature'],stop = 0,step=100) #zt is the output of Neural Netowrk and sample graph is a sample of it
+                            recovery = np.mean(seq_recovery(data,sample_graph))
+                            sub_list.append(recovery)
+                            
+                            ll_fullseq = F.cross_entropy(zt,data.x, reduction='mean').item()
+                            # print(f'perplexity : {np.exp(ll_fullseq):.2f}')
+                            
+                            # _,all_t_val_loss = self.ema.ema_model.compute_val_loss(data,True)
+
+                        # weigth_corr,corr_list,DSM_list = compute_single_site_corr_score_all(self.ema.ema_model,CATH_test_inmem,corr_list,self.config['pred_sasa'])
+                        # corr_record.append(weigth_corr)
+
+                        milestone = self.step // self.save_and_sample_every
+
+                    recovery_list.append(np.mean(sub_list))
+                    print(f'recovery rate is {np.mean(sub_list)}')
+                    perplexity.append(0.1*np.exp(ll_fullseq)) 
+
+                    fig = plt.figure(figsize=(8, 6))  
+                    gs = GridSpec(3, 2, figure=fig)
+
+                    ax1 = fig.add_subplot(gs[0, 0])
+                    ax1.plot(train_loss, label='train_loss')
+                    ax1.plot(val_loss_list, label='val_loss')
+                    # ax1.plot(ce_loss_list,label = 'ce_loss')
+                    if self.config['pred_sasa']:
+                        ax1.plot(mse_loss_list,label = 'mse_loss')
+                    ax1.set_ylim((0, 4))
+                    ax1.legend(loc="upper right", fancybox=True)
+
+                    ax2 = fig.add_subplot(gs[1, 0])
+                    ax2.plot(recovery_list, label='recovery')
+                    ax2.plot(perplexity, label='perplexity * 0.1')
+                    ax2.legend(loc="upper right", fancybox=True)
+                    ax2.set_title(f'best_recovery={max(recovery_list):.4f} at {recovery_list.index(max(recovery_list))}')
+                    ax2.set_ylim((0, 0.8))
+
+
+                    # ax4 = fig.add_subplot(gs[2, 0])
+                    # ax4.plot(corr_record)
+                    # ax4.set_title(f'best_corr={max(corr_record):.4f} at {corr_record.index(max(corr_record))}')
+
+                    # ax3 = fig.add_subplot(gs[:, 1])
+                    # for corr, protein_name in zip(corr_list, DSM_list):
+                    #     ax3.plot(corr, label=protein_name)
+
+                    # ax3.legend(loc='upper left', bbox_to_anchor=(1, 1), fancybox=True, prop={'size': 8})  
+                    
+
+                    plt.subplots_adjust(wspace=0.5, hspace=0.5)
+                    plt.savefig(os.path.join(str(self.results_folder), 'figure', self.save_file_name + f'.png'), dpi=200)
+                    plt.close()
+
+
+                    # utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
+                    self.save(milestone)
+
+                pbar.update(1)
+        train_detail = {'train_loss':train_loss,'val_loss':val_loss_list,'recovery':recovery_list,'perplexity':perplexity}
+        pd.DataFrame(train_detail).to_csv(os.path.join(str(self.results_folder), self.save_file_name + f'.csv'), index=False)
+        print('training complete')
+    
+    def test(self, ratio=0):
+        """
+        !! please delete all files in /test_rr_tmp if test set is changed.
+        ratio: if input a list, plot a rr-ratio figure; if input a number, print recovery rate
+        """
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        recovery_list, perplexity = [], []
+        self.ema.ema_model.eval()
+        with torch.no_grad():
+            sub_list = []
+            ratio_sub_list = [[] for i in range(11)]
+            for data in self.test_loader:
+                print('data batch:', data.batch)
+                data = data.to(device)
+                
+                # _,predx = self.model(data,logit=True)
+                # _,ema_pred = self.ema.ema_model.forward(data)
+                # val_loss,_,_,_ = self.ema.ema_model.compute_val_loss(data,False)
+                val_loss,ce_loss,mse_loss = self.ema.ema_model(data)
+
+                zt,sample_graph = self.ema.ema_model.ddim_sample(data,self.config['sample_temperature'],stop = 0,step=100, ratio=ratio) #zt is the output of Neural Netowrk and sample graph is a sample of it
+                if type(sample_graph) is list:
+                    # print('sample_graph: ', sample_graph)
+                    for i, sample_graph_at_given_ratio in enumerate(sample_graph):
+                        print('final prediction', i, sample_graph_at_given_ratio)
+                        recovery = np.mean(seq_recovery(data, sample_graph_at_given_ratio))
+                        print('recovery', recovery)
+                        ratio_sub_list[i].append(recovery)
+                else:
+                    recovery = np.mean(seq_recovery(data,sample_graph))
+                    sub_list.append(recovery)
+                
+                # print(f'perplexity : {np.exp(ll_fullseq):.2f}')
+                
+                # _,all_t_val_loss = self.ema.ema_model.compute_val_loss(data,True)
+
+            # weigth_corr,corr_list,DSM_list = compute_single_site_corr_score_all(self.ema.ema_model,CATH_test_inmem,corr_list,self.config['pred_sasa'])
+            # corr_record.append(weigth_corr)
+
+        # recovery_list.append(np.mean(sub_list))
+        if not sub_list == []:
+            print(f'recovery rate is {np.mean(sub_list)}')
+        else:
+            # print('ratio_sub_list: ', ratio_sub_list)
+            ratio_recovery_rate = [np.mean(l) for l in ratio_sub_list]
+            print('ratio recovery rate: ', ratio_recovery_rate)
+            plt.figure()
+            plt.plot(ratio, ratio_recovery_rate)
+            plt.xlabel("MSA_retrieval ratio")
+            plt.ylabel("recovery rate")
+            plt.savefig("recovery_rate.png")
+
+
+if __name__ == "__main__" :
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--Date', type = str,default='Debug',
+                        help='Date of experiment')
+                    
+    parser.add_argument('--data_split', action='store_true', default=False) 
+    parser.add_argument('--cath_dir', type=str, default="dataset/cath40_k10_imem_add2ndstrc/process/")
+     
+    parser.add_argument('--objective', type = str,default='pred_x0',
+                        help='the target of training objective, objective must be either pred_x0 or smooth_x0')  
+    
+    parser.add_argument('--lr', type = float,default=1e-4,
+                        help='Learning rate')
+    
+    parser.add_argument('--smooth_temperature', type = float,default=1.0,
+                        help='the temperature used for smoothing label')    
+    
+    parser.add_argument('--wd', type = float,default=1e-2,
+                        help='weight decay')
+    
+    parser.add_argument('--drop_out', type = float,default=0.0,
+                        help='Whether to run with best params for cora. Overrides the choice of dataset')
+
+    parser.add_argument('--timesteps',  type = int,default=700,
+                        help='Whether to run with best params for cora. Overrides the choice of dataset')
+
+    parser.add_argument('--hidden_dim',  type = int,default=16,
+                        help='Whether to run with best params for cora. Overrides the choice of dataset')
+
+    parser.add_argument('--device_id', type = int,default=0,
+                        help='cuda device')
+    
+    parser.add_argument('--sasa_loss_coeff',  type = float,default=1.0,
+                        help='the coeff of mse of sasa prediction')
+
+    parser.add_argument('--sample_temperature', type = float,default=1.0,
+                        help='the temperature of predictive probability when t = 0')
+    
+    parser.add_argument('--depth', type = int,default=1,
+                        help='number of GNN layers')
+    
+    parser.add_argument('--noise_type', type = str,default='uniform',
+                        help='what type of noise apply in diffusion process, uniform or blosum')
+    
+    parser.add_argument('--embedding_dim', type = int,default=16,
+                        help='the dim of feature embedding')   
+    
+    parser.add_argument('--clip_grad_norm',  type = float,default=1.0,
+                        help='clip_grad_norm')
+
+    parser.add_argument('--sampling_method',  type = str,default='ddpm',
+                        help='clip_grad_norm')    
+
+    parser.add_argument('--pred_sasa', action='store_true',#default = False,
+                        help='whether predict sasa for better latent representation for mutation') 
+
+    parser.add_argument('--embedding', action='store_true',#default = True,
+                        help='whether residual embedding the feature') 
+    
+    parser.add_argument('--norm_feat', action='store_true',#default = True,
+                        help='whether normalization node feature in egnn')    
+    
+    parser.add_argument('--embed_ss', action='store_true',#default = True,
+                        help='whether embedding secondary structure')
+    
+    parser.add_argument('--batch_size', type = int,default=32)
+    
+    parser.add_argument('--target_protein_dir', type=str, default=None)
+    
+    parser.add_argument('--output_dir', type = str,default='./protein_DIFF/results',
+                        help='output dir')
+    
+    args = parser.parse_args()
+    config = vars(args)
+
+    os.makedirs(config['output_dir'], exist_ok=True)
+
+    # os.environ["CUDA_VISIBLE_DEVICES"] = str(config['device_id'])
+
+    # config['pred_x0']
+    print('train on CATH dataset')
+    # dataset_arg = dataset_argument(n=51)
+    # dataset_arg['root'] = 'protein_DIFF/'+dataset_arg['root']
+    # train_dataset_inmem = Cath_imem(dataset_arg['root'], dataset_arg['name'], split='test',
+    #                             divide_num=dataset_arg['divide_num'], divide_idx=dataset_arg['divide_idx'],
+    #                             c_alpha_max_neighbors=dataset_arg['c_alpha_max_neighbors'],
+    #                             set_length=dataset_arg['set_length'],
+    #                             struc_2nds_res_path = dataset_arg['struc_2nds_res_path'],
+    #                             random_sampling=True,diffusion=True)
+
+    basedir = args.cath_dir
+    if args.data_split:
+        data_split  = torch.load('dataset/cath43_train_test_split.pt')
+        train_idx, val_idx, test_idx = data_split['train'],data_split['validation'],data_split['test']#single_chain_id,L100.test
+    else:
+        cath_idx = os.listdir(basedir)
+        random.Random(4).shuffle(cath_idx)
+        # split train, val, test
+        train_idx, val_idx, test_idx = cath_idx[1000:], cath_idx[:500], cath_idx[500:100]
+            
+    train_dataset = Cath(train_idx, basedir)
+    val_dataset = Cath(val_idx, basedir)
+    test_dataset = Cath(test_idx, basedir)
+    print(f'train on CATH dataset with {len(train_dataset)}  training data and {len(val_dataset)}  val data')
+
+    if args.target_protein_dir is not None:
+        # example: ago_dir = 'dataset/Ago/process/'
+        target_protein_name = args.target_protein_dir.split('/')[1]
+        target_protein_id = os.listdir(args.target_protein_dir)
+        target_protein_id.sort()
+        random.Random(4).shuffle(target_protein_id)
+        target_protein_train_id, target_protein_test_id = target_protein_id[:-50], target_protein_id[-50:]
+        target_protein_train_dataset = Cath(target_protein_train_id, args.target_protein_dir)
+        target_protein_test_dataset = Cath(target_protein_test_id, args.target_protein_dir)
+        print(f'train on {target_protein_name} dataset with {len(target_protein_train_dataset)}')
+        print(f'test on {target_protein_name} dataset with {len(target_protein_test_dataset)}')
+        # ago_dataset = Cath(ago_id,ago_dir,pred_sasa=False)
+        train_dataset = torch.utils.data.ConcatDataset([train_dataset, target_protein_train_dataset])
+        val_dataset = target_protein_test_dataset
+        test_dataset = target_protein_test_dataset
+        
+    input_feat_dim = train_dataset[0].x.shape[1]+train_dataset[0].extra_x.shape[1]
+    edge_attr_dim = train_dataset[0].edge_attr.shape[1]
+
+    if config['pred_sasa']:
+        model = EGNN_NET(input_feat_dim=input_feat_dim,hidden_channels=config['hidden_dim'],edge_attr_dim=edge_attr_dim,dropout=config['drop_out'],n_layers=config['depth'],update_edge = True,embedding=config['embedding'],embedding_dim=config['embedding_dim'],norm_feat=config['norm_feat'],output_dim=21,embedding_ss=config['embed_ss'])
+    else:
+        model = EGNN_NET(input_feat_dim=input_feat_dim,hidden_channels=config['hidden_dim'],edge_attr_dim=edge_attr_dim,dropout=config['drop_out'],n_layers=config['depth'],update_edge = True,embedding=config['embedding'],embedding_dim=config['embedding_dim'],norm_feat=config['norm_feat'],embedding_ss=config['embed_ss'])#GVP,Protein_MPNN,
+    
+    # model = DataParallel(model)
+    
+    diffusion = Sparse_DIGRESS(model=model,config=config,timesteps=config['timesteps'],objective=config['objective'],label_smooth_tem=config['smooth_temperature'])
+
+    trainer  = Trianer(config,
+                        diffusion,
+                        train_dataset, 
+                        val_dataset,
+                        test_dataset,
+                        train_batch_size = args.batch_size,
+                        gradient_accumulate_every=1,
+                        save_and_sample_every=1,
+                        train_num_steps=90000,
+                        train_lr=config['lr'],
+                        weight_decay = config['wd'],
+                        results_folder=config['output_dir'])
+    trainer.train()
+    
+
+# python3 protein_DIFF/diffusion_sequence_protein.py --lr 5e-4 --timesteps 500 --hidden_dim 128 --wd 1e-5 --clip_grad_norm 1e3 --device_id 0 --depth 6 --drop_out 0.1 --norm_feat --embedding_dim 128 --Date 'May14_Debug' --objective 'pred_x0' --smooth_temperature 0.9
 
 
 

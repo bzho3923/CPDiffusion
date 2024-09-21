@@ -2,6 +2,7 @@
 from torch_geometric.data import Dataset, download_url,Batch,Data
 import torch
 import os
+import numpy as np
 from torch_geometric.loader import DataListLoader, DataLoader
 import random
 
@@ -31,7 +32,7 @@ class Cath(Dataset):
             extra_x_feature = torch.cat([data.x[:,22:],mu_r_norm],dim = 1)
         else:
             extra_x_feature = torch.cat([data.x[:,20].unsqueeze(dim=1),data.x[:,22:],mu_r_norm],dim = 1)
-        extra_x_feature = torch.cat([data.x[:,20:], mu_r_norm],dim=1)
+
         graph = Data(
             x=data.x[:, :20],
             extra_x = extra_x_feature,

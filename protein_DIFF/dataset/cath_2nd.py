@@ -1,13 +1,12 @@
-import os
-import torch
-import sys
-sys.path.append(os.getcwd())
+from dataset_src.utils import normalize, safe_index, one_hot_res, log, dihedral, NormalizeProtein, dataset_argument, get_stat
 import argparse
 from ast import Continue
 from json import load
 from typing import Callable, List, Optional
 from torch_geometric.loader import DataLoader
-
+import os
+import torch
+import sys
 import math
 import numpy as np
 from torch_geometric.data import (
@@ -47,7 +46,6 @@ from torch_geometric.data.dataset import Dataset, IndexType
 from torch_geometric.data.separate import separate
 import numpy as np
 from numpy import argmax
-from protein_DIFF.dataset.utils import normalize, safe_index, one_hot_res, log, dihedral, NormalizeProtein, dataset_argument, get_stat
 
 
 print('import cath imem 2nd')
@@ -57,7 +55,7 @@ print('import cath imem 2nd')
 warnings.filterwarnings("ignore")
 
 
-class Cath_imem(InMemoryDataset):
+class Cath(Dataset):
     r"""
     Args:
         root (string): Root directory where the dataset should be saved.
@@ -149,8 +147,9 @@ class Cath_imem(InMemoryDataset):
     # define a mapping of chars to integers
     char_to_int = dict((c, i) for i, c in enumerate(struc_2nds_res_alphabet))
 
-    def __init__(self, root: str, name: str,
-                 split: str = 'train',
+    def __init__(self, root: str, 
+                 processed_file_names:str,
+                 name = '40',
                  num_residue_type: int = 20,
                  micro_radius: int = 20,
                  c_alpha_max_neighbors: int = 10,
@@ -174,17 +173,14 @@ class Cath_imem(InMemoryDataset):
                  normalize_file: str = None,
                  struc_2nds_res_path: str = None,
                  ):
+        
         self.name = name
-        assert self.name in self.names
-        self.split = split
-        assert self.split in self.splits
-
         self.num_residue_type = num_residue_type
         self.micro_radius = micro_radius
         self.c_alpha_max_neighbors = c_alpha_max_neighbors
         self.seq_dist_cut = seq_dist_cut
         self.cutoff = cutoff
-
+        # self.processed_file_names = processed_file_names
         self.num_val = num_val
         self.num_test = num_test
         self.divide_num = divide_num
@@ -211,9 +207,9 @@ class Cath_imem(InMemoryDataset):
 
         super().__init__(root, transform, pre_transform, pre_filter)
 
-        self.data, self.slices = torch.load(
-            self.processed_paths[self.splits.index(self.split)])
-        self.nums_amino_cum = self.slices['x']
+        # self.data, self.slices = torch.load(
+        #     self.processed_paths[self.splits.index(self.split)])
+        # self.nums_amino_cum = self.slices['x']
 
     @property
     def raw_file_names(self) -> str:
@@ -237,10 +233,8 @@ class Cath_imem(InMemoryDataset):
         if not os.path.exists(dir_root):
             os.mkdir(dir_root)
         dir_name = os.path.join(dir_root, 'graph')
-        dir_name_process = os.path.join(dir_root, 'process')
         if not os.path.exists(dir_name):
             os.mkdir(dir_name)
-            os.mkdir(dir_name_process)
         if not self.set_length:
             self.set_length = len(os.listdir(dir_name))
         return dir_name
@@ -272,13 +266,17 @@ class Cath_imem(InMemoryDataset):
         for protein_name in self.wrong_proteins:
             file.writelines(protein_name + '\n')
         file.close()
-
+    
+        
     def process(self):
+        self.generate_protein_graph()
+        self.write_info()
+        
+    def process_(self):
         self.generate_protein_graph()
         self.write_info()
 
         filenames = os.listdir(self.saved_graph_dir)
-        filenames.sort()
         protein_length = len(filenames)
         if self.set_length:
             protein_length = min(protein_length, self.set_length)
@@ -286,7 +284,7 @@ class Cath_imem(InMemoryDataset):
         if not self.normalize_file:
             self.normalize_file = get_stat(self.saved_graph_dir)
 
-        random.Random(4).shuffle(filenames)
+        random.shuffle(filenames)
         filenames_list = [filenames[:-(self.num_val + self.num_test)],
                           filenames[-(self.num_val + self.num_test):-self.num_test],
                           filenames[-self.num_test:]]
@@ -300,20 +298,18 @@ class Cath_imem(InMemoryDataset):
                 dist_list.append(graph.distances)
                 del graph['distances']
                 del graph['edge_dist']
-
-                if self.is_normalize:
-                    normalize_transform = NormalizeProtein(filename=self.normalize_file)
-                    graph = normalize_transform(graph)
-                if self.pre_filter is not None:
-                    graph =  self.pre_filte(graph)
-                    # data_list = [d for d in data_list if self.pre_filter(d)]
-
-                if self.pre_transform is not None:
-                    graph = self.pre_transform(graph)
-                    # data_list = [self.pre_transform(d) for d in data_list]
                 data_list.append(graph)
-                torch.save(graph,os.path.join('dataset/cath40_k10_imem_add2ndstrc/process', file))
 
+            if self.is_normalize:
+                normalize_transform = NormalizeProtein(
+                    filename=self.normalize_file)
+                data_list = [d for d in data_list if normalize_transform(d)]
+
+            if self.pre_filter is not None:
+                data_list = [d for d in data_list if self.pre_filter(d)]
+
+            if self.pre_transform is not None:
+                data_list = [self.pre_transform(d) for d in data_list]
 
             self.collate(data_list)
             torch.save(self.collate(data_list), self.processed_paths[k])
@@ -327,7 +323,6 @@ class Cath_imem(InMemoryDataset):
             if name in ['1byiA00','1c1yB00']:
 #             if name in ['1bteA00', '1byiA00','1c1yB00']:
                 continue
-            print(name)
             saved_graph_filename = os.path.join(
                 self.saved_graph_dir, name + '.pt')
             if os.path.exists(saved_graph_filename):
@@ -336,23 +331,17 @@ class Cath_imem(InMemoryDataset):
             if (name in self.wrong_proteins) or (not protein_filename):
                 continue
             rec, rec_coords, c_alpha_coords, n_coords, c_coords = self.get_receptor_inference(protein_filename)
-            if self.struc_2nds_res_path:
-                struc_2nds_res_filename = os.path.join(self.struc_2nds_res_path, name)
-                struc_2nd_res = self.get_struc2ndRes(struc_2nds_res_filename)
-            else:
-                struc_2nd_res = None
-            if struc_2nd_res is not None:
-                if c_alpha_coords.shape[0] == struc_2nd_res.shape[0]:
-                    rec_graph = self.get_calpha_graph(
-                        rec, c_alpha_coords, n_coords, c_coords, rec_coords, struc_2nd_res)
-                    if not rec_graph:
-                        self.wrong_proteins.append(name)
-                        continue
-                    print(rec_graph)
-                    torch.save(rec_graph, saved_graph_filename)
-                else: 
-                    self.wrong_proteins.append(name)
-            
+            struc_2nds_res_filename = os.path.join(self.struc_2nds_res_path, name)
+            struc_2nd_res = self.get_struc2ndRes(struc_2nds_res_filename)
+            if struc_2nd_res == None:
+                continue
+            rec_graph = self.get_calpha_graph(
+                rec, c_alpha_coords, n_coords, c_coords, rec_coords, struc_2nd_res)
+            if not rec_graph:
+                self.wrong_proteins.append(name)
+                continue
+
+            torch.save(rec_graph, saved_graph_filename)
 
     def rec_residue_featurizer(self, rec, one_hot=True, add_feature=None):
         num_res = len([_ for _ in rec.get_residues()])
@@ -360,45 +349,42 @@ class Cath_imem(InMemoryDataset):
         for add_feature_1 in add_feature:
             if add_feature_1.any():
                 num_feature += add_feature_1.shape[1]
-                print(add_feature_1.shape)
+
         res_feature = torch.zeros(num_res, self.num_residue_type + num_feature)
         count = 0
-        try:
-            self.sr.compute(rec, level="R")
-            for residue in rec.get_residues():
-                sasa = residue.sasa
-                for atom in residue:
-                    if atom.name == 'CA':
-                        bfactor = atom.bfactor
-                assert not np.isinf(bfactor)
-                assert not np.isnan(bfactor)
-                assert not np.isinf(sasa)
-                assert not np.isnan(sasa)
+        self.sr.compute(rec, level="R")
+        for residue in rec.get_residues():
+            sasa = residue.sasa
+            for atom in residue:
+                if atom.name == 'CA':
+                    bfactor = atom.bfactor
+            assert not np.isinf(bfactor)
+            assert not np.isnan(bfactor)
+            assert not np.isinf(sasa)
+            assert not np.isnan(sasa)
 
-                residx = safe_index(
-                    self.allowable_features['possible_amino_acids'], residue.get_resname())
-                res_feat_1 = one_hot_res(
-                    residx, num_residue_type=self.num_residue_type) if one_hot else [residx]
-                if not res_feat_1:
-                    return False
-                res_feat_1.append(sasa)
-                res_feat_1.append(bfactor)
-                if num_feature > 2:
-                    for add_feature_1 in add_feature:
-                        if add_feature_1.any():
-                            res_feat_1.extend(list(add_feature_1[count, :]))
-                res_feature[count, :] = torch.tensor(
-                    res_feat_1, dtype=torch.float32)
-                count += 1
+            residx = safe_index(
+                self.allowable_features['possible_amino_acids'], residue.get_resname())
+            res_feat_1 = one_hot_res(
+                residx, num_residue_type=self.num_residue_type) if one_hot else [residx]
+            if not res_feat_1:
+                return False
+            res_feat_1.append(sasa)
+            res_feat_1.append(bfactor)
+            if num_feature > 2:
+                for add_feature_1 in add_feature:
+                    if add_feature_1.any():
+                        res_feat_1.extend(list(add_feature_1[count, :]))
+            res_feature[count, :] = torch.tensor(
+                res_feat_1, dtype=torch.float32)
+            count += 1
 
-            for k in range(self.num_residue_type, self.num_residue_type + 2):
-                mean = res_feature[:, k].mean()
-                std = res_feature[:, k].std()
-                res_feature[:, k] = (res_feature[:, k] -
-                                    mean) / (std + 0.000000001)
-            return res_feature
-        except TypeError:
-            return None
+        for k in range(self.num_residue_type, self.num_residue_type + 2):
+            mean = res_feature[:, k].mean()
+            std = res_feature[:, k].std()
+            res_feature[:, k] = (res_feature[:, k] -
+                                 mean) / (std + 0.000000001)
+        return res_feature
 
     def get_node_features(self, n_coords, c_coords, c_alpha_coords, coord_mask, with_coord_mask=True, use_angle=False, use_omega=False):
         num_res = n_coords.shape[0]
@@ -442,9 +428,7 @@ class Cath_imem(InMemoryDataset):
 
     def get_calpha_graph(self, rec, c_alpha_coords, n_coords, c_coords, coords, struc_2nd_res = None):
         scalar_feature, vec_feature = self.get_node_features(
-            n_coords, c_coords, c_alpha_coords, coord_mask=None, with_coord_mask=False, 
-            use_angle=self.use_angle, use_omega=self.use_omega
-            )
+            n_coords, c_coords, c_alpha_coords, coord_mask=None, with_coord_mask=False, use_angle=self.use_angle, use_omega=self.use_omega)
         # Extract 3D coordinates and n_i,u_i,v_i
         # vectors of representative residues ################
         residue_representatives_loc_list = []
@@ -530,56 +514,52 @@ class Cath_imem(InMemoryDataset):
             
         if isinstance(x, bool) and (not x):
             return False
-        if x is not None:
-            graph = Data(
-                x=x[:,:-8],
-                ss = x[:,-8:],
-                pos=residue_representatives_loc_feat,
-                edge_attr=self.get_edge_features(
-                    src_list, dst_list, dist_list, divisor=4),
-                edge_index=torch.tensor([src_list, dst_list]),
-                edge_dist=torch.tensor(dist_list),
-                distances=torch.tensor(distances),
-                mu_r_norm=torch.from_numpy(np.array(mean_norm_list).astype(np.float32)))
 
-            # Loop over all edges of the graph and build the various p_ij, q_ij, k_ij, t_ij pairs
-            edge_feat_ori_list = []
-            for i in range(len(dist_list)):
-                src = src_list[i]
-                dst = dst_list[i]
-                # place n_i, u_i, v_i as lines in a 3x3 basis matrix
-                basis_matrix = np.stack(
-                    (n_i_feat[dst, :], u_i_feat[dst, :], v_i_feat[dst, :]), axis=0)
-                p_ij = np.matmul(basis_matrix,
-                                residue_representatives_loc_feat[src, :] - residue_representatives_loc_feat[
-                                    dst, :])
-                q_ij = np.matmul(basis_matrix, n_i_feat[src, :])  # shape (3,)
-                k_ij = np.matmul(basis_matrix, u_i_feat[src, :])
-                t_ij = np.matmul(basis_matrix, v_i_feat[src, :])
-                s_ij = np.concatenate(
-                    (p_ij, q_ij, k_ij, t_ij), axis=0)  # shape (12,)
-                edge_feat_ori_list.append(s_ij)
+        graph = Data(
+            x=x[:,:-8],
+            ss = x[:,-8:],
+            pos=residue_representatives_loc_feat,
+            edge_attr=self.get_edge_features(
+                src_list, dst_list, dist_list, divisor=4),
+            edge_index=torch.tensor([src_list, dst_list]),
+            edge_dist=torch.tensor(dist_list),
+            distances=torch.tensor(distances),
+            mu_r_norm=torch.from_numpy(np.array(mean_norm_list).astype(np.float32)))
 
-            edge_feat_ori_feat = np.stack(
-                edge_feat_ori_list, axis=0)  # shape (num_edges, 4, 3)
-            edge_feat_ori_feat = torch.from_numpy(
-                edge_feat_ori_feat.astype(np.float32))
+        # Loop over all edges of the graph and build the various p_ij, q_ij, k_ij, t_ij pairs
+        edge_feat_ori_list = []
+        for i in range(len(dist_list)):
+            src = src_list[i]
+            dst = dst_list[i]
+            # place n_i, u_i, v_i as lines in a 3x3 basis matrix
+            basis_matrix = np.stack(
+                (n_i_feat[dst, :], u_i_feat[dst, :], v_i_feat[dst, :]), axis=0)
+            p_ij = np.matmul(basis_matrix,
+                             residue_representatives_loc_feat[src, :] - residue_representatives_loc_feat[
+                                 dst, :])
+            q_ij = np.matmul(basis_matrix, n_i_feat[src, :])  # shape (3,)
+            k_ij = np.matmul(basis_matrix, u_i_feat[src, :])
+            t_ij = np.matmul(basis_matrix, v_i_feat[src, :])
+            s_ij = np.concatenate(
+                (p_ij, q_ij, k_ij, t_ij), axis=0)  # shape (12,)
+            edge_feat_ori_list.append(s_ij)
 
-            graph.edge_attr = torch.cat(
-                [graph.edge_attr, edge_feat_ori_feat], axis=1)  # (num_edges, 17)
-            graph = self.remove_node(graph, graph.x.shape[0]-1)
-            # self.get_calpha_graph_single(graph, 6)
-            return graph
-        else:
-            return None
+        edge_feat_ori_feat = np.stack(
+            edge_feat_ori_list, axis=0)  # shape (num_edges, 4, 3)
+        edge_feat_ori_feat = torch.from_numpy(
+            edge_feat_ori_feat.astype(np.float32))
+
+        graph.edge_attr = torch.cat(
+            [graph.edge_attr, edge_feat_ori_feat], axis=1)  # (num_edges, 17)
+        graph = self.remove_node(graph, graph.x.shape[0]-1)
+        # self.get_calpha_graph_single(graph, 6)
+        return graph
 
     def remove_node(self, graph, node_idx):
         new_graph = Data.clone(graph)
         # delete node
         new_graph.x = torch.cat(
             [new_graph.x[:node_idx, :], new_graph.x[node_idx+1:, :]])
-        new_graph.ss = torch.cat(
-            [new_graph.ss[:node_idx, :], new_graph.ss[node_idx+1:, :]])
         new_graph.pos = torch.cat(
             [new_graph.pos[:node_idx, :], new_graph.pos[node_idx+1:, :]])
         new_graph.mu_r_norm = torch.cat(
@@ -614,7 +594,6 @@ class Cath_imem(InMemoryDataset):
             text_file.close()
             # integer encode input data
             integer_encoded = [self.char_to_int[char] for char in data]
-            print(len(data))
             data = F.one_hot(torch.tensor(integer_encoded), num_classes = self.num_struc_2nds_res_alphabet)
             return data
         else:
@@ -704,10 +683,7 @@ class Cath_imem(InMemoryDataset):
         return rec, coords, c_alpha_coords, n_coords, c_coords
 
     def len(self):
-        if self.random_sampling:
-            return len(self.slices['x']) - 1
-        else:
-            return self.nums_amino_cum[-1]
+        return len(self.processed_file_names)   
 
     def get_statistic_info(self):
         node_num = torch.zeros(self.length_total)
@@ -761,7 +737,6 @@ class Cath_imem(InMemoryDataset):
             pos=self.data.pos[idx_x0:idx_x1, :],
             edge_index=edge_index,
             edge_attr=edge_attr_feats,
-            ss = self.data.ss[idx_x0:idx_x1,:],
             y = torch.tensor((), dtype=self.data.x.dtype).unsqueeze(0),
         )
             generate_graph = Data.clone(data)
@@ -842,11 +817,11 @@ class Cath_imem(InMemoryDataset):
 
 if __name__ == '__main__':
     dataset_arg = dataset_argument(n=51)
-    train_dataset = Cath_imem(dataset_arg['root'], dataset_arg['name'], split='test',
+    train_dataset = Cath(root = 'dataset/cath_2nd/', processed_file_names = [],
                               divide_num=dataset_arg['divide_num'], divide_idx=dataset_arg['divide_idx'],
                               c_alpha_max_neighbors=dataset_arg['c_alpha_max_neighbors'],
                               set_length=dataset_arg['set_length'],
                               struc_2nds_res_path = dataset_arg['struc_2nds_res_path'],
-                              random_sampling=True,diffusion=True)
-    print(len(train_dataset))
-    print(train_dataset[10])
+                              random_sampling=True)
+    # print(len(train_dataset))
+    # print(train_dataset[10])
